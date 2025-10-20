@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KNN Overlap Analysis</title>
+    <style>
+        /* ... (CSS remains the same) ... */
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f9; }
+        .container { display: flex; flex-direction: column; gap: 20px; max-width: 1200px; margin: auto; }
+        .controls { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .knn-box { display: flex; gap: 20px; margin-top: 15px; }
+        .knn-config { flex: 1; border: 1px solid #ccc; padding: 15px; border-radius: 6px; }
+        .knn-config h3 { margin-top: 0; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        label, button, select, input { margin-bottom: 10px; display: block; }
+        button { padding: 10px 15px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background-color: #0056b3; }
+        .results-container { margin-top: 30px; }
+        .results-container h2 { border-bottom: 2px solid #007bff; padding-bottom: 10px; }
+        .patient-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; }
+        .patient-card { border: 1px solid #ddd; padding: 15px; border-radius: 6px; background-color: #fafafa; }
+        .overlap-metric { font-size: 1.2em; font-weight: bold; padding: 15px; background-color: #e9ecef; border-radius: 4px; }
+        .error { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Text-Image Embedding KNN Overlap Analysis</h1>
+
+        <!-- Status box: displays progress messages while data/model/KNN calculations run -->
+        <div id="status-box" aria-live="polite" style="margin-bottom:12px; padding:10px; background:#fff3cd; border:1px solid #ffeeba; border-radius:6px; display:none;">
+            <strong>Status:</strong> <span id="status-message">Idle</span>
+        </div>
+
+        <div class="controls">
+            <h2>Configuration</h2>
+
+            <label for="k-neighbors">Number of Nearest Neighbors (K):</label>
+            <input type="number" id="k-neighbors" value="5" min="1" max="20">
+
+            <div class="knn-box">
+                <div class="knn-config" id="text-config">
+                    <h3>1. Text Embedding KNN</h3>
+                    <label for="text-dr-model">Dimensionality Reduction Model:</label>
+                    <select id="text-dr-model">
+                        <option value="no_model" selected>No Model</option>
+                        <option value="pca">PCA</option>
+                        <option value="umap">UMAP </option>
+                        <option value="tsne">t-SNE</option>
+                    </select>
+
+                    <label for="text-components">Components/Iterations:</label>
+                    <input type="number" id="text-components" value="3" min="2" max="768" disabled>
+
+                    <label for="text-metric">Distance Metric:</label>
+                    <select id="text-metric">
+                        <option value="cosine" selected>Cosine</option>
+                        <option value="euclidean">Euclidean</option>
+                        <option value="sine">Sine (1 - Cosine)</option>
+                    </select>
+                </div>
+
+                <div class="knn-config" id="image-config">
+                    <h3>2. Image Embedding KNN</h3>
+                    <label for="image-dr-model">Dimensionality Reduction Model:</label>
+                    <select id="image-dr-model">
+                        <option value="no_model" selected>No Model</option>
+                        <option value="pca">PCA</option>
+                        <option value="umap">UMAP</option>
+                        <option value="tsne">t-SNE</option>
+                    </select>
+
+                    <label for="image-components">Components/Iterations:</label>
+                    <input type="number" id="image-components" value="3" min="2" max="512" disabled>
+
+                    <label for="image-metric">Distance Metric:</label>
+                    <select id="image-metric">
+                        <option value="euclidean" selected>Euclidean</option>
+                        <option value="cosine">Cosine</option>
+                        <option value="sine">Sine (1 - Cosine)</option>
+                    </select>
+                </div>
+            </div>
+
+            <button onclick="runAnalysis()">Run Analysis and Calculate Overlap</button>
+        </div>
+
+        <div class="results-container">
+            <h2>Results</h2>
+            <div id="average-overlap" class="overlap-metric"></div>
+            <h3>KNN Results per Sample</h3>
+            <div id="knn-results" class="patient-results">
+                <p>Run the analysis to see results...</p>
+            </div>
+        </div>
+
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.26.3/full/pyodide.js"></script>
+    <script src="https://unpkg.com/umap-js/umd/umap-min.js"></script>
+    <script src="https://raw.githubusercontent.com/karpathy/tsnejs/master/tsne.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.1.5/jszip.min.js"></script>
+
+    <script src="euclidean.js"></script>
+    <script src="cosine.js"></script>
+    <script src="sine.js"></script>
+
+    <script src="pca.js"></script>
+    <script src="umap.js"></script>
+    <script src="tsne.js"></script>
+
+    <script src="analysis.js"></script>
+</body>
+</html>
