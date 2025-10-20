@@ -20,7 +20,7 @@ function parseEmbedding(embStr) {
  */
 async function loadData() {
     console.log("Fetching embeddings ZIP file...");
-    setStatus('Loading data...');
+    setStatus('Phase 1/5 (0%): Downloading data...');
     try {
         // 1. Fetch the ZIP file
         const response = await fetch(EMBEDDINGS_ZIP_URL);
@@ -62,38 +62,98 @@ async function loadData() {
             throw new Error(`File '${fileName}' not found in the ZIP archive.`);
         }
 
-        const tsvContent = await file.async('string');
-        console.log("Successfully unzipped and loaded TSV content. Parsing data...");
+        // Get the file as a Uint8Array and stream-parse it in chunks to avoid
+        // allocating a giant string or a large array of lines at once.
+        console.log("Successfully fetched ZIP file. Parsing TSV entry as stream...");
+        setStatus('Phase 2/5 (20%): Extracting ZIP...');
+        const uint8array = await file.async('uint8array');
 
-        // 3. Parse the TSV content
-        const rows = tsvContent.trim().split('\n');
-        // Headers are typically the first line, split by tab. Use 'embeddings' for text.
-        const headers = rows[0].split('\t');
+        // Stream parser that decodes chunks and processes completed lines.
+        const decoder = new TextDecoder('utf-8');
+        const CHUNK_SIZE = 64 * 1024; // 64KB
+        let pos = 0;
+        let carry = '';
+        let headers = null;
         const data = [];
+        let lastPercent = -1;
 
-        for (let i = 1; i < rows.length; i++) {
-            const values = rows[i].split('\t');
-            const row = {};
-            headers.forEach((header, index) => {
-                // Remove carriage returns often present in TSV files
-                row[header.trim()] = values[index] ? values[index].trim() : '';
-            });
+        setStatus('Phase 3/5 (40%): Parsing data - 0%');
+        while (pos < uint8array.length) {
+            const end = Math.min(pos + CHUNK_SIZE, uint8array.length);
+            const chunk = uint8array.subarray(pos, end);
+            pos = end;
 
-            // Map the generic 'embeddings' column to 'text_embedding'
-            // and the specific 'image_embedding' column.
-            data.push({
-                i: parseInt(row.i),
-                id: row.id,
-                patient_id: row.patient_id,
-                cancer_type: row.cancer_type,
-                // Use 'embeddings' for the Text KNN analysis
-                text_embedding: parseEmbedding(row.embeddings),
-                // Use 'image_embedding' for the Image KNN analysis
-                image_embedding: parseEmbedding(row.image_embedding)
-            });
+            // Decode the current chunk and prepend any carry-over from the previous chunk
+            let text = decoder.decode(chunk, { stream: true });
+            text = carry + text;
+
+            // Split into lines, keep the last partial line as carry
+            const lines = text.split('\n');
+            carry = lines.pop();
+
+            for (let li = 0; li < lines.length; li++) {
+                const rawLine = lines[li].replace(/\r$/, '');
+                if (!rawLine) continue;
+
+                if (!headers) {
+                    headers = rawLine.split('\t');
+                    continue;
+                }
+
+                const values = rawLine.split('\t');
+                const row = {};
+                headers.forEach((header, index) => {
+                    row[header.trim()] = values[index] ? values[index].trim() : '';
+                });
+
+                data.push({
+                    i: parseInt(row.i),
+                    id: row.id,
+                    patient_id: row.patient_id,
+                    cancer_type: row.cancer_type,
+                    text_embedding: parseEmbedding(row.embeddings),
+                    image_embedding: parseEmbedding(row.image_embedding)
+                });
+            }
+
+            // Update percent progress, but only when it changes to avoid UI thrash
+            const percent = Math.floor((pos / uint8array.length) * 100);
+            if (percent !== lastPercent) {
+                lastPercent = percent;
+                setStatus(`Phase 3/5 (40%): Parsing data - ${percent}%`);
+                // Yield to the browser so it can repaint the UI and show the updated percent.
+                // Using requestAnimationFrame is lighter than setTimeout(0) and schedules
+                // the continuation after the next paint.
+                await new Promise(resolve => requestAnimationFrame(resolve));
+            }
         }
-    console.log(`Data parsing complete. Loaded ${data.length} samples.`);
-    setStatus('Data loaded');
+
+        // Process any remaining carry as the last line
+        if (carry) {
+            const lastLine = carry.replace(/\r$/, '');
+            if (lastLine) {
+                if (!headers) {
+                    headers = lastLine.split('\t');
+                } else {
+                    const values = lastLine.split('\t');
+                    const row = {};
+                    headers.forEach((header, index) => {
+                        row[header.trim()] = values[index] ? values[index].trim() : '';
+                    });
+                    data.push({
+                        i: parseInt(row.i),
+                        id: row.id,
+                        patient_id: row.patient_id,
+                        cancer_type: row.cancer_type,
+                        text_embedding: parseEmbedding(row.embeddings),
+                        image_embedding: parseEmbedding(row.image_embedding)
+                    });
+                }
+            }
+        }
+
+        console.log(`Data parsing complete. Loaded ${data.length} samples.`);
+        setStatus('Phase 3/5 (60%): Data loaded');
         return data.filter(d => d.text_embedding.length > 0 && d.image_embedding.length > 0);
 
     } catch (error) {
@@ -140,43 +200,152 @@ async function applyDR(embeddings, model, components) {
 
 // --- 4. K-NEAREST NEIGHBORS (KNN) ---
 
-// This function is ASYNCHRONOUS because it calls applyDR
-// NOTE: We now include the components parameter explicitly to pass the correct value to applyDR
-async function getKNN(data, K, embeddingKey, drModel, components, metric) {
-    const distanceFn = getDistanceFunction(metric);
-    const rawEmbeddings = data.map(d => d[embeddingKey]);
-
-    if (embeddingKey === 'text_embedding') setStatus('Calculating KNN for text...');
-    if (embeddingKey === 'image_embedding') setStatus('Calculating KNN for image...');
-
-    // 1. Apply DR - Use AWAIT here, passing the correct components value
-    const processedEmbeddings = await applyDR(rawEmbeddings, drModel, components);
-
-    // 2. Calculate Distances and Find K Neighbors
-    const knnResults = {}; // Map: id -> [neighbor_id1, neighbor_id2, ...]
-
-    for (let i = 0; i < processedEmbeddings.length; i++) {
-        const queryId = data[i].id;
-        const queryEmb = processedEmbeddings[i];
-
-        const distances = [];
-        for (let j = 0; j < processedEmbeddings.length; j++) {
-            const candidateId = data[j].id;
-            if (queryId !== candidateId) { // Exclude self
-                const dist = distanceFn(queryEmb, processedEmbeddings[j]);
-                distances.push({ id: candidateId, dist: dist });
-            }
-        }
-
-        // Sort by distance and take the top K
-        distances.sort((a, b) => a.dist - b.dist);
-        const neighbors = distances.slice(0, K).map(d => d.id);
-        knnResults[queryId] = neighbors;
-    }
-    return knnResults;
+// Helper function to pre-compute squared norms for Euclidean distance
+function precomputeSquaredNorms(embeddings) {
+    return embeddings.map(emb => emb.reduce((sum, val) => sum + val * val, 0));
 }
 
-// --- 5. MAIN ANALYSIS FUNCTION ---
+// Worker pool management
+class WorkerPool {
+    constructor(numWorkers) {
+        this.workers = [];
+        this.workerStatus = new Map(); // Track worker status and progress
+        this.results = new Map();      // Store results from workers
+        this.progressCallback = null;   // Callback for progress updates
+
+        // Create workers
+        for (let i = 0; i < numWorkers; i++) {
+            const worker = new Worker('knn-worker.js');
+            worker.onmessage = (e) => this.handleWorkerMessage(e.data, i);
+            this.workers.push(worker);
+            this.workerStatus.set(i, { busy: false, progress: 0 });
+        }
+    }
+
+    handleWorkerMessage(message, workerId) {
+        if (message.type === 'progress') {
+            this.workerStatus.get(workerId).progress = message.progress;
+            if (this.progressCallback) {
+                // Calculate overall progress across all workers
+                const totalProgress = Array.from(this.workerStatus.values())
+                    .reduce((sum, status) => sum + status.progress, 0);
+                const overallProgress = Math.floor(totalProgress / this.workers.length);
+                this.progressCallback(overallProgress);
+            }
+        } else if (message.type === 'complete') {
+            this.results.set(workerId, message.results);
+            this.workerStatus.get(workerId).busy = false;
+            this.workerStatus.get(workerId).progress = 100;
+        }
+    }
+
+    async processData(chunks) {
+        this.results.clear();
+        const promises = [];
+
+        for (let i = 0; i < chunks.length; i++) {
+            const workerId = i % this.workers.length;
+            const worker = this.workers[workerId];
+
+            // Add workerId to chunk data
+            chunks[i].workerId = workerId;
+
+            // Create promise for this chunk
+            const promise = new Promise((resolve) => {
+                const checkComplete = setInterval(() => {
+                    if (!this.workerStatus.get(workerId).busy) {
+                        clearInterval(checkComplete);
+                        resolve(this.results.get(workerId));
+                    }
+                }, 100);
+            });
+
+            promises.push(promise);
+
+            // Mark worker as busy and send data
+            this.workerStatus.get(workerId).busy = true;
+            this.workerStatus.get(workerId).progress = 0;
+            worker.postMessage({ type: 'process', ...chunks[i] });
+        }
+
+        // Wait for all chunks to complete
+        const results = await Promise.all(promises);
+
+        // Combine results from all workers
+        return results.reduce((acc, curr) => ({ ...acc, ...curr }), {});
+    }
+
+    setProgressCallback(callback) {
+        this.progressCallback = callback;
+    }
+
+    terminate() {
+        this.workers.forEach(worker => worker.terminate());
+    }
+}
+
+// Main KNN function
+async function getKNN(data, K, embeddingKey, drModel, components, metric) {
+    const rawEmbeddings = data.map(d => d[embeddingKey]);
+
+    if (embeddingKey === 'text_embedding') setStatus('Phase 4/5 (70%): Calculating text KNN...');
+    if (embeddingKey === 'image_embedding') setStatus('Phase 4/5 (80%): Calculating image KNN...');
+
+    await new Promise(resolve => requestAnimationFrame(resolve));
+
+    const drPhase = embeddingKey === 'text_embedding' ? '70' : '80';
+    let processedEmbeddings;
+
+    if (drModel === 'no_model') {
+        setStatus(`Phase 4/5 (${drPhase}%): Computing KNN on raw embeddings...`);
+        processedEmbeddings = rawEmbeddings;
+    } else {
+        setStatus(`Phase 4/5 (${drPhase}%): Applying ${drModel.toUpperCase()}...`);
+        await new Promise(resolve => requestAnimationFrame(resolve));
+        processedEmbeddings = await applyDR(rawEmbeddings, drModel, components);
+    }
+
+    // Pre-compute squared norms for Euclidean distance
+    const squaredNorms = metric === 'euclidean' ? precomputeSquaredNorms(processedEmbeddings) : null;
+
+    setStatus(`Phase 4/5 (${drPhase}%): Computing nearest neighbors...`);
+    await new Promise(resolve => requestAnimationFrame(resolve));
+
+    // Initialize worker pool with number of workers based on CPU cores
+    // navigator.hardwareConcurrency returns the number of logical cores
+    const numWorkers = Math.max(2, Math.min(4, navigator.hardwareConcurrency || 4));
+    const workerPool = new WorkerPool(numWorkers);
+
+    // Prepare data chunks for workers
+    const chunkSize = Math.ceil(processedEmbeddings.length / (numWorkers * 2));
+    const chunks = [];
+
+    for (let start = 0; start < processedEmbeddings.length; start += chunkSize) {
+        const end = Math.min(start + chunkSize, processedEmbeddings.length);
+        chunks.push({
+            startIdx: start,
+            endIdx: end,
+            embeddings: processedEmbeddings,
+            ids: data.map(d => d.id),
+            K,
+            metric,
+            squaredNorms
+        });
+    }
+
+    // Set up progress callback
+    workerPool.setProgressCallback(progress => {
+        setStatus(`Phase 4/5 (${drPhase}%): Computing nearest neighbors - ${progress}%`);
+    });
+
+    // Process data using worker pool
+    const knnResults = await workerPool.processData(chunks);
+
+    // Clean up workers
+    workerPool.terminate();
+
+    return knnResults;
+}// --- 5. MAIN ANALYSIS FUNCTION ---
 
 // This function is ASYNCHRONOUS because it calls loadData and getKNN
 async function runAnalysis() {
@@ -220,7 +389,7 @@ async function runAnalysis() {
     const imageKNN = await getKNN(data, K, 'image_embedding', imageDrModel, imageComponents, imageMetric);
 
     // --- C. Calculate Overlap per Sample ---
-    setStatus('Calculating overlap between text and image KNN...');
+    setStatus('Phase 5/5 (90%): Calculating overlap between KNNs...');
         const overlapResults = data.map(sample => {
             const textNeighbors = new Set(textKNN[sample.id]);
             const imageNeighbors = new Set(imageKNN[sample.id]);
@@ -272,7 +441,7 @@ async function runAnalysis() {
         const overallAverageOverlap = totalOverlapSum / totalPatientSamples;
 
     // --- E. Display Results ---
-    setStatus('Done');
+    setStatus('Phase 5/5 (100%): Analysis complete');
         document.getElementById('knn-results').innerHTML = htmlOutput;
         document.getElementById('average-overlap').innerHTML = `
             Overall Average Overlap of Nearest Neighbors (K=${K}): ${overallAverageOverlap.toFixed(4)}

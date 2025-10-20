@@ -43,6 +43,21 @@ async function tsneTransform(embeddings, components, iterations) {
         // A robust solution would use a Web Worker, but for this structure, a simple loop suffices.
         for (let k = 0; k < actualIterations; k++) {
             tsne.step();
+
+            // Update progress every 5% or every 10 iterations (whichever is larger)
+            if (k % Math.max(10, Math.floor(actualIterations / 20)) === 0) {
+                const percent = Math.floor((k / actualIterations) * 100);
+                if (typeof window.setStatus === 'function') {
+                    try { window.setStatus(`t-SNE: ${percent}%`); } catch (e) { /* noop */ }
+                }
+                // Yield to allow UI updates
+                await new Promise(resolve => requestAnimationFrame(resolve));
+            }
+        }
+
+        // Ensure 100% status
+        if (typeof window.setStatus === 'function') {
+            try { window.setStatus('t-SNE: 100%'); } catch (e) { /* noop */ }
         }
 
         console.log("t-SNE computation completed.");
