@@ -153,8 +153,19 @@ async function loadData() {
         }
 
         console.log(`Data parsing complete. Loaded ${data.length} samples.`);
+
+        // Sanity-check: filter valid samples (both text and image embeddings present)
+        const validData = data.filter(d => d.text_embedding.length > 0 && d.image_embedding.length > 0);
+        const validCount = validData.length;
+        // Print a short summary and the first valid sample for runtime inspection
+        console.log('Sanity check after loadData():', {
+            totalRows: data.length,
+            validSamples: validCount,
+            firstValidSample: validData.length ? validData[0] : null
+        });
+
         setStatus('Phase 3/5 (60%): Data loaded');
-        return data.filter(d => d.text_embedding.length > 0 && d.image_embedding.length > 0);
+        return validData;
 
     } catch (error) {
         console.error("Error during data loading:", error);
@@ -180,7 +191,7 @@ function getDistanceFunction(metric) {
 // --- 3. DIMENSIONALITY REDUCTION (DR) HANDLER ---
 
 // This function is ASYNCHRONOUS to handle external library calls
-async function applyDR(embeddings, model, components) {
+async function applyDR(embeddings, model, components, iterations) {
     if (model === 'no_model') {
         return embeddings; // Return the original embeddings
     }
@@ -191,8 +202,8 @@ async function applyDR(embeddings, model, components) {
         return await applyUMAP(embeddings, components);
     }
     if (model === 'tsne') {
-        // Pass the component value (which is iterations for t-SNE)
-        return await applyTSNE(embeddings, components);
+        // Pass components as output dimensionality and iterations as the t-SNE budget
+        return await applyTSNE(embeddings, components, iterations);
     }
 
     return embeddings;
@@ -285,7 +296,7 @@ class WorkerPool {
 }
 
 // Main KNN function
-async function getKNN(data, K, embeddingKey, drModel, components, metric) {
+async function getKNN(data, K, embeddingKey, drModel, components, iterations, metric) {
     const rawEmbeddings = data.map(d => d[embeddingKey]);
 
     if (embeddingKey === 'text_embedding') setStatus('Phase 4/5 (70%): Calculating text KNN...');
@@ -301,8 +312,8 @@ async function getKNN(data, K, embeddingKey, drModel, components, metric) {
         processedEmbeddings = rawEmbeddings;
     } else {
         setStatus(`Phase 4/5 (${drPhase}%): Applying ${drModel.toUpperCase()}...`);
-        await new Promise(resolve => requestAnimationFrame(resolve));
-        processedEmbeddings = await applyDR(rawEmbeddings, drModel, components);
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    processedEmbeddings = await applyDR(rawEmbeddings, drModel, components, iterations);
     }
 
     // Pre-compute squared norms for Euclidean distance
@@ -365,11 +376,21 @@ async function runAnalysis() {
 
         const textDrModel = document.getElementById('text-dr-model').value;
         const textMetric = document.getElementById('text-metric').value;
-        const textComponents = parseInt(document.getElementById('text-components').value);
+        let textComponents = parseInt(document.getElementById('text-components').value);
+        let textIterations = parseInt(document.getElementById('text-iterations').value);
 
         const imageDrModel = document.getElementById('image-dr-model').value;
         const imageMetric = document.getElementById('image-metric').value;
-        const imageComponents = parseInt(document.getElementById('image-components').value);
+        let imageComponents = parseInt(document.getElementById('image-components').value);
+        let imageIterations = parseInt(document.getElementById('image-iterations').value);
+
+        // Ensure component counts default to 3 when a model is selected but the input is empty/invalid
+        if (textDrModel !== 'no_model' && (isNaN(textComponents) || textComponents < 1)) textComponents = 3;
+        if (imageDrModel !== 'no_model' && (isNaN(imageComponents) || imageComponents < 1)) imageComponents = 3;
+
+        // Ensure iterations are sensible for t-SNE only
+        if (textDrModel === 'tsne' && (isNaN(textIterations) || textIterations < 10)) textIterations = 200;
+        if (imageDrModel === 'tsne' && (isNaN(imageIterations) || imageIterations < 10)) imageIterations = 200;
 
         if (isNaN(K) || K <= 0) {
             alert("K (Nearest Neighbors) must be a positive number.");
@@ -382,11 +403,11 @@ async function runAnalysis() {
 
         // --- A. Calculate KNN for Text ---
         // Changed getKNN signature to pass explicit components value
-    const textKNN = await getKNN(data, K, 'text_embedding', textDrModel, textComponents, textMetric);
+    const textKNN = await getKNN(data, K, 'text_embedding', textDrModel, textComponents, textIterations, textMetric);
 
         // --- B. Calculate KNN for Image ---
         // Changed getKNN signature to pass explicit components value
-    const imageKNN = await getKNN(data, K, 'image_embedding', imageDrModel, imageComponents, imageMetric);
+    const imageKNN = await getKNN(data, K, 'image_embedding', imageDrModel, imageComponents, imageIterations, imageMetric);
 
     // --- C. Calculate Overlap per Sample ---
     setStatus('Phase 5/5 (90%): Calculating overlap between KNNs...');
@@ -433,7 +454,7 @@ async function runAnalysis() {
                 <div class="patient-card">
                     <strong>Patient ID: ${patient_id}</strong><br>
                     Avg Overlap (out of ${K}): <strong>${avgOverlap.toFixed(3)}</strong><br>
-                    Total Samples: ${counts.length}
+
                 </div>
             `;
         }
@@ -446,6 +467,150 @@ async function runAnalysis() {
         document.getElementById('average-overlap').innerHTML = `
             Overall Average Overlap of Nearest Neighbors (K=${K}): ${overallAverageOverlap.toFixed(4)}
         `;
+
+        // Maintain a history of runs (persist in the window so it survives multiple calls)
+        try {
+            if (!window.runsHistory) window.runsHistory = [];
+
+            const textLabel = `${textDrModel.toUpperCase()} / ${textMetric.toUpperCase()}`;
+            const imageLabel = `${imageDrModel.toUpperCase()} / ${imageMetric.toUpperCase()}`;
+
+            // Store this run's KNN maps along with labels and parameters
+            const runEntry = {
+                id: window.runsHistory.length + 1,
+                K,
+                textModel: textDrModel,
+                textMetric: textMetric,
+                textComponents: textComponents,
+                imageModel: imageDrModel,
+                imageMetric: imageMetric,
+                imageComponents: imageComponents,
+                // keep KNN maps for potential future use
+                textKNN,
+                imageKNN,
+                // overall overlap value for this run
+                overallOverlap: overallAverageOverlap
+            };
+
+            window.runsHistory.push(runEntry);
+
+            // Helper: compute average overlap between two knn maps
+            function computeAverageOverlap(knnA, knnB) {
+                let sum = 0;
+                let count = 0;
+                for (const sample of data) {
+                    const id = sample.id;
+                    const listA = knnA[id] || [];
+                    const listB = knnB[id] || [];
+                    if (!listA.length && !listB.length) continue;
+                    const setB = new Set(listB);
+                    let inter = 0;
+                    for (const x of listA) if (setB.has(x)) inter++;
+                    sum += inter;
+                    count++;
+                }
+                return count === 0 ? 0 : sum / count;
+            }
+
+            // Build tables grouped by K. For each K, create a matrix with rows=models*metrics and cols=models*metrics
+            const runs = window.runsHistory;
+            // Define ordering
+            const models = ['no_model', 'pca', 'umap', 'tsne'];
+            const metrics = ['euclidean', 'cosine', 'sine'];
+
+            // Helper to render nice model names
+            function displayModel(m) {
+                if (m === 'no_model') return 'No Model';
+                if (m === 'pca') return 'PCA';
+                if (m === 'umap') return 'UMAP';
+                if (m === 'tsne') return 't-SNE';
+                return String(m).toUpperCase();
+            }
+
+            // Group runs by K only. For each K we render a full matrix with
+            // rows = (No Model, PCA, UMAP, t-SNE) x (Euclidean, Cosine, Sine)
+            // and columns the same. If multiple historical runs match the same
+            // text/image model+metric combo we show the most recent run's value.
+            const runsByK = {};
+            for (const r of runs) {
+                if (!runsByK[r.K]) runsByK[r.K] = [];
+                runsByK[r.K].push(r);
+            }
+
+            const modelsFixed = ['no_model', 'pca', 'umap', 'tsne'];
+            const metricsFixed = ['euclidean', 'cosine', 'sine'];
+
+            let multiTableHtml = '';
+            for (const kKey of Object.keys(runsByK).sort((a, b) => a - b)) {
+                const group = runsByK[kKey];
+
+                // Helper: find the most recent run matching the combo
+                function findMostRecentRun(textModel, textMetric, imageModel, imageMetric) {
+                    for (let i = group.length - 1; i >= 0; i--) {
+                        const rt = group[i];
+                        if (rt.textModel === textModel && rt.textMetric === textMetric && rt.imageModel === imageModel && rt.imageMetric === imageMetric) {
+                            return rt;
+                        }
+                    }
+                    return null;
+                }
+
+                let table = '<div class="crosstab-box" style="background:#fff; padding:12px; border-radius:6px; border:1px solid #e6e6e6; margin-bottom:12px;">';
+                table += `<strong>Cross-tabulation for K=${kKey}</strong>`;
+                table += '<table style="width:100%; border-collapse:collapse; margin-top:8px;">';
+
+                // Header row
+                table += '<thead><tr>';
+                table += '<th style="border-bottom:1px solid #ddd; text-align:left; padding:6px;">Text \\ Image</th>';
+                for (const cm of modelsFixed) {
+                    for (const metric of metricsFixed) {
+                        let compLabel = '';
+                        if (cm === 'no_model') compLabel = ' (dim=768)';
+                        table += `<th style="border-bottom:1px solid #ddd; text-align:center; padding:6px;">${displayModel(cm)}${compLabel}<br>${metric.toUpperCase()}</th>`;
+                    }
+                }
+                table += '</tr></thead>';
+
+                // Body rows
+                table += '<tbody>';
+                for (const rm of modelsFixed) {
+                    for (const rmetric of metricsFixed) {
+                        let rowLabel = displayModel(rm);
+                        if (rm === 'no_model') rowLabel += ' (dim=768)';
+                        table += `<tr><td style="padding:6px; border-bottom:1px solid #f0f0f0;">${rowLabel}<br>${rmetric.toUpperCase()}</td>`;
+
+                        for (const cm of modelsFixed) {
+                            for (const cmetric of metricsFixed) {
+                                const runMatch = findMostRecentRun(rm, rmetric, cm, cmetric);
+                                if (runMatch) {
+                                    table += `<td style="padding:6px; text-align:center;">${Number(runMatch.overallOverlap).toFixed(6)}</td>`;
+                                } else {
+                                    table += `<td style="padding:6px; text-align:center; color:#999;">-</td>`;
+                                }
+                            }
+                        }
+
+                        table += '</tr>';
+                    }
+                }
+                table += '</tbody></table>';
+                table += '<div style="font-size:0.9em; color:#666; margin-top:8px;">Each table shows the most recent overall-overlap value for the given Text (rows) vs Image (cols) model+metric combos for this K. Missing runs are shown as &quot;-&quot;.</div>';
+                table += '</div>';
+
+                multiTableHtml += table;
+            }
+
+            // Debugging aids: print runs and generated HTML so we can see why
+            // a table might not appear in the page (empty runs, errors, etc.).
+            console.debug('crosstab: runs for K groups:', Object.keys(runsByK).length, 'groups');
+            console.debug('crosstab: generated HTML length:', multiTableHtml ? multiTableHtml.length : 0);
+            const ct = document.getElementById('crosstab-container');
+            if (ct) {
+                ct.innerHTML = multiTableHtml || '<div style="color:#666;">No cross-tab data yet. Run an analysis to populate tables for each K.</div>';
+            }
+        } catch (e) {
+            console.warn('Failed to build crosstab history table:', e);
+        }
 
     } catch (error) {
         document.getElementById('knn-results').innerHTML = `<p class="error">An error occurred during analysis: ${error.message}</p>`;
@@ -466,37 +631,57 @@ function setStatus(message) {
 // Add event listeners for component inputs to handle the t-SNE-specific logic
 document.getElementById('text-dr-model').addEventListener('change', function() {
     const componentsInput = document.getElementById('text-components');
+    const iterationsInput = document.getElementById('text-iterations');
     const model = this.value;
 
-    if (model === 'tsne') {
-        componentsInput.disabled = false; // Enable for t-SNE (iterations)
-        componentsInput.value = '200';    // Default iterations for t-SNE
+    if (model === 'no_model') {
+        componentsInput.disabled = true;
+        componentsInput.value = '';
+        iterationsInput.disabled = true;
+        iterationsInput.value = '';
+    } else if (model === 'tsne') {
+        // t-SNE: allow setting both output dims and iterations
+        componentsInput.disabled = false;
+        if (!componentsInput.value) componentsInput.value = '3';
+        iterationsInput.disabled = false;
+        if (!iterationsInput.value) iterationsInput.value = '200';
     } else {
-        // PCA, UMAP, or No Model
-        componentsInput.disabled = false; // Keep enabled for PCA/UMAP (target dimension)
-        if (model === 'no_model') {
-             componentsInput.disabled = true;
-        }
-        componentsInput.value = '3';      // Default component count for PCA/UMAP
+        // PCA/UMAP: allow setting output dims only
+        componentsInput.disabled = false;
+        if (!componentsInput.value) componentsInput.value = '3';
+        iterationsInput.disabled = true;
+        iterationsInput.value = '';
     }
 });
 
 document.getElementById('image-dr-model').addEventListener('change', function() {
     const componentsInput = document.getElementById('image-components');
+    const iterationsInput = document.getElementById('image-iterations');
     const model = this.value;
 
-    if (model === 'tsne') {
-        componentsInput.disabled = false; // Enable for t-SNE (iterations)
-        componentsInput.value = '200';    // Default iterations for t-SNE
+    if (model === 'no_model') {
+        componentsInput.disabled = true;
+        componentsInput.value = '';
+        iterationsInput.disabled = true;
+        iterationsInput.value = '';
+    } else if (model === 'tsne') {
+        // t-SNE: allow setting both output dims and iterations
+        componentsInput.disabled = false;
+        if (!componentsInput.value) componentsInput.value = '3';
+        iterationsInput.disabled = false;
+        if (!iterationsInput.value) iterationsInput.value = '200';
     } else {
-        // PCA, UMAP, or No Model
-        componentsInput.disabled = false; // Keep enabled for PCA/UMAP (target dimension)
-        if (model === 'no_model') {
-             componentsInput.disabled = true;
-        }
-        componentsInput.value = '3';      // Default component count for PCA/UMAP
+        // PCA/UMAP: allow setting output dims only
+        componentsInput.disabled = false;
+        if (!componentsInput.value) componentsInput.value = '3';
+        iterationsInput.disabled = true;
+        iterationsInput.value = '';
     }
 });
+
+// Initialize component inputs to match default select values on load
+document.getElementById('text-dr-model').dispatchEvent(new Event('change'));
+document.getElementById('image-dr-model').dispatchEvent(new Event('change'));
 
 // Run loadData once when the script loads (but without blocking the main thread immediately)
 // The runAnalysis function will ensure the data is fully loaded before proceeding.

@@ -41,7 +41,8 @@
             <div class="knn-box">
                 <div class="knn-config" id="text-config">
                     <h3>1. Text Embedding KNN</h3>
-                    <label for="text-dr-model">Dimensionality Reduction Model:</label>
+
+                    <label for="text-dr-model">Model:</label>
                     <select id="text-dr-model">
                         <option value="no_model" selected>No Model</option>
                         <option value="pca">PCA</option>
@@ -49,20 +50,23 @@
                         <option value="tsne">t-SNE</option>
                     </select>
 
-                    <label for="text-components">Components/Iterations:</label>
-                    <input type="number" id="text-components" value="3" min="2" max="768" disabled>
+                        <label for="text-components">Output dimensions (components):</label>
+                        <input type="number" id="text-components" value="3" min="1" max="768" >
+
+                        <label for="text-iterations" style="margin-top:6px;">t-SNE iterations:</label>
+                        <input type="number" id="text-iterations" value="200" min="10" max="5000" disabled>
 
                     <label for="text-metric">Distance Metric:</label>
                     <select id="text-metric">
-                        <option value="cosine" selected>Cosine</option>
-                        <option value="euclidean">Euclidean</option>
+                        <option value="euclidean" selected>Euclidean</option>
+                        <option value="cosine">Cosine</option>
                         <option value="sine">Sine (1 - Cosine)</option>
                     </select>
                 </div>
 
                 <div class="knn-config" id="image-config">
                     <h3>2. Image Embedding KNN</h3>
-                    <label for="image-dr-model">Dimensionality Reduction Model:</label>
+                    <label for="image-dr-model">Model:</label>
                     <select id="image-dr-model">
                         <option value="no_model" selected>No Model</option>
                         <option value="pca">PCA</option>
@@ -70,8 +74,11 @@
                         <option value="tsne">t-SNE</option>
                     </select>
 
-                    <label for="image-components">Components/Iterations:</label>
-                    <input type="number" id="image-components" value="3" min="2" max="512" disabled>
+                        <label for="image-components">Output dimensions (components):</label>
+                        <input type="number" id="image-components" value="3" min="1" max="512" >
+
+                        <label for="image-iterations" style="margin-top:6px;">t-SNE iterations:</label>
+                        <input type="number" id="image-iterations" value="200" min="10" max="5000" disabled>
 
                     <label for="image-metric">Distance Metric:</label>
                     <select id="image-metric">
@@ -88,27 +95,23 @@
         <div class="results-container">
             <h2>Results</h2>
             <div id="average-overlap" class="overlap-metric"></div>
+            <!-- Crosstab container: populated by analysis.js -->
+            <div id="crosstab-container" style="margin-top:12px; margin-bottom:12px;"></div>
             <h3>KNN Results per Sample</h3>
             <div id="knn-results" class="patient-results">
                 <p>Run the analysis to see results...</p>
             </div>
         </div>
-
     </div>
 
-    <script src="https://cdn.jsdelivr.net/pyodide/v0.26.3/full/pyodide.js"></script>
-    <script src="https://unpkg.com/umap-js/umd/umap-min.js"></script>
     <script src="https://raw.githubusercontent.com/karpathy/tsnejs/master/tsne.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.1.5/jszip.min.js"></script>
-    <script src="knn-worker.js"></script>
-
-    <script src="euclidean.js"></script>
-    <script src="cosine.js"></script>
-    <script src="sine.js"></script>
-
-    <script src="pca.js"></script>
-    <script src="umap.js"></script>
     <script src="tsne.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.26.3/full/pyodide.js"></script>
+    <script src="pca.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/umap-js@1.4.0/lib/umap-js.min.js"></script>
+    <script src="umap.js"></script>
 
     <script src="analysis.js"></script>
 </body>
