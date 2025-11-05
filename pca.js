@@ -42,7 +42,8 @@ async function initializePyodide() {
 }
 
 // Immediately start the initialization when the script is loaded
-initializePyodide();
+// Do not eagerly initialize Pyodide on script load; initialize lazily when PCA is requested.
+// initializePyodide();
 
 
 // --- Core PCA Function ---

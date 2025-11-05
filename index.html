@@ -32,6 +32,8 @@
             <strong>Status:</strong> <span id="status-message">Idle</span>
         </div>
 
+        <div id="speed-mode-note" style="font-size:0.95em; color:#555; margin-bottom:8px; display:none;">Note: t-SNE will run in fast mode using a random projection to speed up computation.</div>
+
         <div class="controls">
             <h2>Configuration</h2>
 
@@ -104,7 +106,8 @@
         </div>
     </div>
 
-    <script src="https://raw.githubusercontent.com/karpathy/tsnejs/master/tsne.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tsne@1.0.1/tsne.js"></script>
+    <script src="randomproj.js"></script>
     <script src="tsne.js"></script>
 
     <script src="https://cdn.jsdelivr.net/pyodide/v0.26.3/full/pyodide.js"></script>

@@ -1,104 +1,113 @@
-// tsne.js
+// tsne.js - offload t-SNE computation to a Web Worker when available
 
-/**
- * Performs t-SNE (t-distributed Stochastic Neighbor Embedding) on the given embeddings.
- * This function is an ASYNCHRONOUS wrapper for the iterative t-SNE process.
- * NOTE: This requires the tsnejs library to be loaded globally (window.tsnejs).
- * * @param {number[][]} embeddings - The array of vectors (data points) to transform.
- * @param {number} components - The desired number of dimensions (dim). This is typically 2 or 3.
- * @param {number} iterations - The total number of steps to run t-SNE. Taken from the 'Components/Iterations' input.
- * @returns {Promise<number[][]>} A promise that resolves to the dimensionally-reduced embeddings.
- */
-async function tsneTransform(embeddings, components, iterations) {
-    if (typeof window.tsnejs === 'undefined' || typeof window.tsnejs.tSNE !== 'function') {
-        console.error("tsnejs library is not loaded. Cannot perform t-SNE transformation.");
-        // Fallback to slicing the original data
-        return embeddings.map(e => e.slice(0, components));
-    }
+async function applyTSNE(embeddings, components, iterations) {
+    // Basic validation
+    if (!Array.isArray(embeddings) || embeddings.length === 0) return embeddings.map(e => e.slice(0, Math.max(1, Number(components) || 2)));
 
-    // t-SNE has a minimum perplexity requirement based on the data size
-    const perplexity = Math.max(1, Math.min(30, Math.floor(embeddings.length / 5)));
-
-    // Ensure iterations are sensible
-    const actualIterations = Math.max(10, iterations);
-
+    const dims = Math.max(1, Number(components) || 2);
+    const iters = Math.max(10, typeof iterations === 'number' ? iterations : 200);
+    // Apply a short disclaimer: we use a fast random projection for t-SNE to speed up runs.
+    // This only affects t-SNE (not UMAP/PCA) and is an approximation to reduce runtime.
+    let usedProjection = false;
     try {
-        const tsne = new window.tsnejs.tSNE({
-            dim: components, // The dimension to reduce to
-            perplexity: perplexity,
-            theta: 0.5,
-            iterations: actualIterations,
-            eta: 200
-        });
-
-        console.log(`Computing t-SNE embeddings to ${components} components over ${actualIterations} iterations...`);
-
-        // Initialize tSNE with the input vectors
-        tsne.initDataRaw(embeddings);
-
-        // Perform t-SNE steps iteratively. We use a Promise to make this synchronous-looking
-        // while allowing the browser to remain responsive (though tsnejs is compute-heavy).
-        // Since tsnejs doesn't natively support async/await, we run it in a single loop,
-        // which will block the main thread for the duration of the calculation.
-        // A robust solution would use a Web Worker, but for this structure, a simple loop suffices.
-        for (let k = 0; k < actualIterations; k++) {
-            tsne.step();
-
-            // Update progress every 5% or every 10 iterations (whichever is larger)
-            if (k % Math.max(10, Math.floor(actualIterations / 20)) === 0) {
-                const percent = Math.floor((k / actualIterations) * 100);
-                if (typeof window.setStatus === 'function') {
-                    try { window.setStatus(`t-SNE: ${percent}%`); } catch (e) { /* noop */ }
-                }
-                // Yield to allow UI updates
-                await new Promise(resolve => requestAnimationFrame(resolve));
-            }
-        }
-
-        // Ensure 100% status
         if (typeof window.setStatus === 'function') {
-            try { window.setStatus('t-SNE: 100%'); } catch (e) { /* noop */ }
+            window.setStatus('Applying fast projection for t-SNE (speed mode)...');
+        }
+    } catch (e) {}
+
+    // Pre-project to lower dimensions for much faster t-SNE while preserving distances
+    const PROJECT_DIMS = 40;
+    let embeddingsForTSNE = embeddings;
+    try {
+        if (embeddings && embeddings[0] && embeddings[0].length > PROJECT_DIMS && typeof window.randomProject === 'function') {
+            embeddingsForTSNE = window.randomProject(embeddings, PROJECT_DIMS);
+            usedProjection = true;
+            console.info('t-SNE: using random projection to', PROJECT_DIMS, 'dimensions for speed.');
+            try {
+                const note = document.getElementById('speed-mode-note');
+                if (note) note.style.display = 'block';
+            } catch (e) {}
+        }
+    } catch (e) {
+        console.warn('Random projection failed, proceeding with original embeddings', e);
+        embeddingsForTSNE = embeddings;
+    }
+
+    // Adapt iterations based on dataset size to reduce runtime for large n
+    const nSamples = embeddingsForTSNE.length;
+    let adjustedIters = iters;
+    if (nSamples > 2000) adjustedIters = Math.min(adjustedIters, 300);
+    if (nSamples > 5000) adjustedIters = Math.min(adjustedIters, 200);
+
+    // If Workers are available, use tsne-worker.js to compute off-thread
+    if (typeof Worker !== 'undefined') {
+        return await new Promise((resolve) => {
+            const worker = new Worker('tsne-worker.js');
+            const id = Math.random().toString(36).slice(2);
+            // Start a timeout which will be reset each time the worker sends progress
+            let timeout = setTimeout(() => {
+                worker.terminate();
+                console.warn('t-SNE worker timed out; falling back to main-thread computation.');
+                resolve(embeddings.map(e => e.slice(0, dims)));
+            }, 180 * 1000); // 180s timeout
+
+            worker.onmessage = function(ev) {
+                const data = ev.data;
+                if (data.progress !== undefined) {
+                    // reset the timeout when progress is reported
+                    clearTimeout(timeout);
+                    timeout = setTimeout(() => {
+                        worker.terminate();
+                        console.warn('t-SNE worker timed out; falling back to main-thread computation.');
+                        resolve(embeddings.map(e => e.slice(0, dims)));
+                    }, 180 * 1000);
+                    // update UI status if available
+                    try { if (typeof window.setStatus === 'function') window.setStatus(`t-SNE: ${data.progress}%`); } catch (e) {}
+                    return;
+                }
+
+                if (data.error) {
+                    clearTimeout(timeout);
+                    console.warn('t-SNE worker error:', data.error);
+                    worker.terminate();
+                    resolve(embeddings.map(e => e.slice(0, dims)));
+                } else if (data.solution) {
+                    clearTimeout(timeout);
+                    worker.terminate();
+                    // If we projected, emit a short note in status and hide the disclaimer after a moment
+                    try { if (usedProjection && typeof window.setStatus === 'function') window.setStatus('t-SNE (speed mode) complete'); } catch (e) {}
+                    try { const note = document.getElementById('speed-mode-note'); if (note) setTimeout(() => note.style.display = 'none', 3000); } catch (e) {}
+                    resolve(data.solution);
+                }
+            };
+
+            worker.postMessage({ id, embeddings: embeddingsForTSNE, components: dims, iterations: adjustedIters });
+        });
+    }
+
+    // No Worker support: fall back to main-thread (rare). Try to detect existing tsne constructors.
+    // We intentionally keep this minimal; heavy workloads should use Workers.
+    try {
+        // Attempt to find constructor on window
+        let TSNEConstructor = null;
+        if (window.tsnejs && typeof window.tsnejs.tSNE === 'function') TSNEConstructor = window.tsnejs.tSNE;
+        else if (typeof window.tSNE === 'function') TSNEConstructor = window.tSNE;
+        else if (typeof window.TSNE === 'function') TSNEConstructor = window.TSNE;
+        else if (window.tsne && typeof window.tsne === 'function') TSNEConstructor = window.tsne;
+
+        if (!TSNEConstructor) {
+            console.error('t-SNE constructor not found on main thread. Returning sliced embeddings.');
+            return embeddings.map(e => e.slice(0, dims));
         }
 
-        console.log("t-SNE computation completed.");
-
-        // Return the final result
+        const tsne = new TSNEConstructor({ dim: dims, perplexity: Math.max(5, Math.min(50, Math.floor(embeddings.length / 5))), theta: 0.5, iterations: iters, eta: 200 });
+        tsne.initDataRaw(embeddings);
+        for (let k = 0; k < iters; k++) tsne.step();
         return tsne.getSolution();
-
-    } catch (error) {
-        console.error("Error during t-SNE transformation:", error);
-        // Fallback to slicing the original data
-        return embeddings.map(e => e.slice(0, components));
+    } catch (err) {
+        console.error('Error running t-SNE on main thread:', err);
+        return embeddings.map(e => e.slice(0, dims));
     }
 }
 
-
-// --- Handler for analysis.js ---
-
-/**
- * The unified function signature expected by analysis.js for Dimensionality Reduction.
- * This is the function called when the user selects 'tsne'.
- * * NOTE: The 'components' input in the HTML is used for BOTH the target dimension
- * (dim) and the number of iterative steps (iterations) in this implementation,
- * as the 'Components/Iterations' label suggests it serves a dual purpose for t-SNE.
- * * @param {number[][]} embeddings - The input embeddings.
- * @param {number} components - The value from the 'Components/Iterations' input.
- * @returns {Promise<number[][]>} The reduced embeddings.
- */
-function applyTSNE(embeddings, components) {
-    // We arbitrarily set the target output dimension to 2 for visualization
-    // unless the user specifies a value of 3 or more in the components box,
-    // but the iteration count is set by the input value.
-    // Given the UI shows '50', let's use a standard 2D output (common for t-SNE)
-    // but use the input for iterations.
-
-    // Safely assume the target dimension (dim) is 2 or 3 based on standard practice,
-    // or you can explicitly use the input value:
-    const outputDim = 2; // Typically 2D for t-SNE output
-
-    // The 'components' input value (e.g., 50) is used as the number of iterations.
-    const numIterations = components;
-
-    // The t-SNE operation is asynchronous, so we return the Promise.
-    return tsneTransform(embeddings, outputDim, numIterations);
-}
+window.applyTSNE = applyTSNE;

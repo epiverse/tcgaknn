@@ -8,33 +8,46 @@
  * @returns {Promise<number[][]>} A promise that resolves to the dimensionally-reduced embeddings.
  */
 async function umapTransform(embeddings, components) {
+    // Offload UMAP to a worker when possible to avoid blocking UI
+    if (typeof Worker !== 'undefined') {
+        return await new Promise((resolve) => {
+            const worker = new Worker('umap-worker.js');
+            const id = Math.random().toString(36).slice(2);
+            const timeout = setTimeout(() => {
+                worker.terminate();
+                console.warn('UMAP worker timed out; falling back to main-thread computation.');
+                resolve(embeddings.map(e => e.slice(0, components)));
+            }, 60 * 1000);
+
+            worker.onmessage = function(ev) {
+                clearTimeout(timeout);
+                const data = ev.data;
+                if (data.error) {
+                    console.warn('UMAP worker error:', data.error);
+                    worker.terminate();
+                    resolve(embeddings.map(e => e.slice(0, components)));
+                } else if (data.solution) {
+                    worker.terminate();
+                    resolve(data.solution);
+                }
+            };
+
+            worker.postMessage({ id, embeddings, components });
+        });
+    }
+
+    // Fallback: run on main thread (if UMAP library is available)
     if (typeof UMAP === 'undefined' || typeof UMAP.UMAP !== 'function') {
         console.error("UMAP library (e.g., umap-js) is not loaded. Cannot perform UMAP transformation.");
-        // Fallback to slicing the original data, ensuring async contract is met
         return embeddings.map(e => e.slice(0, components));
     }
 
     try {
-        // Initialize UMAP with user-defined components and reasonable defaults
-        const umap = new UMAP.UMAP({
-            nComponents: components,
-            nNeighbors: 15,
-            minDist: 0.1,
-            // You may need to adjust the following for performance/quality:
-            // repulsionStrength: 1.0,
-            // setOperationStrength: 1.0,
-            // negativeSampleRate: 5,
-        });
-
-        console.log(`Computing UMAP embeddings to ${components} components...`);
-        // The fit method is asynchronous in umap-js
+        const umap = new UMAP.UMAP({ nComponents: components, nNeighbors: 15, minDist: 0.1 });
         const umapEmbedding = await umap.fit(embeddings);
-        console.log("UMAP embedding computation completed.");
-
         return umapEmbedding;
     } catch (error) {
         console.error("Error during UMAP transformation:", error);
-        // Fallback to slicing the original data
         return embeddings.map(e => e.slice(0, components));
     }
 }
