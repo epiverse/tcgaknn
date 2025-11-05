@@ -92,6 +92,10 @@
             </div>
 
             <button onclick="runAnalysis()">Run Analysis and Calculate Overlap</button>
+            <div style="margin-top:12px;">
+                <button id="plot-overlap-btn" style="background:#ed62e6;">Plot overlap vs K</button>
+                <div id="plot-disclaimer" style="font-size:0.9em; color:#666; margin-top:6px; display:inline-block; margin-left:10px;">This may take a while — K will be: 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 8373 (clamped to dataset size).</div>
+            </div>
         </div>
 
         <div class="results-container">
@@ -99,6 +103,12 @@
             <div id="average-overlap" class="overlap-metric"></div>
             <!-- Crosstab container: populated by analysis.js -->
             <div id="crosstab-container" style="margin-top:12px; margin-bottom:12px;"></div>
+            <div id="plot-container" style="margin-top:18px; background:#fff; padding:12px; border-radius:6px; border:1px solid #e6e6e6; width:100%; max-width:100%; box-sizing:border-box;">
+                <h3>Overlap vs K</h3>
+                <div style="width:100%; height:360px; max-width:100%;">
+                    <canvas id="overlap-plot" style="width:100%; height:100%; display:block;"></canvas>
+                </div>
+            </div>
             <h3>KNN Results per Sample</h3>
             <div id="knn-results" class="patient-results">
                 <p>Run the analysis to see results...</p>
@@ -115,6 +125,14 @@
 
     <script src="https://cdn.jsdelivr.net/npm/umap-js@1.4.0/lib/umap-js.min.js"></script>
     <script src="umap.js"></script>
+
+    <!-- Charting library for plotting overlap curves -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+    <!-- Distance metric utilities required by analysis.js -->
+    <script src="euclidean.js"></script>
+    <script src="cosine.js"></script>
+    <script src="sine.js"></script>
 
     <script src="analysis.js"></script>
 </body>

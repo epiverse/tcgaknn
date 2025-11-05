@@ -216,6 +216,82 @@ function precomputeSquaredNorms(embeddings) {
     return embeddings.map(emb => emb.reduce((sum, val) => sum + val * val, 0));
 }
 
+// Compute KNN for a set of query sample IDs only (returns map id -> neighborIdArray)
+// This avoids computing/storing full KNN maps for all samples, which can be memory-heavy.
+async function computeKNNForQueries(data, queryIds, K, embeddingKey, drModel, components, iterations, metric) {
+    // Build raw embeddings array and id->index map
+    const ids = data.map(d => d.id);
+    const rawEmbeddings = data.map(d => d[embeddingKey]);
+
+    // Apply DR if requested (may be heavy; we keep the same behavior as getKNN)
+    let processedEmbeddings = rawEmbeddings;
+    if (drModel !== 'no_model') {
+        setStatus('Plot: applying dimensionality reduction (this may take a while)...');
+        await new Promise(resolve => requestAnimationFrame(resolve));
+        processedEmbeddings = await applyDR(rawEmbeddings, drModel, components, iterations);
+    }
+
+    // Precompute squared norms for Euclidean distance
+    const squaredNorms = metric === 'euclidean' ? precomputeSquaredNorms(processedEmbeddings) : null;
+
+    // Helper: distance function selection
+    const distFunc = getDistanceFunction(metric);
+
+    // Map id -> neighbor array
+    const result = Object.create(null);
+
+    // Build index map for id -> index
+    const idToIndex = Object.create(null);
+    for (let i = 0; i < ids.length; i++) idToIndex[ids[i]] = i;
+
+    // Process queries in small batches so the UI can remain responsive
+    const batchSize = 5; // number of queries per batch
+    for (let qi = 0; qi < queryIds.length; qi += batchSize) {
+        const end = Math.min(queryIds.length, qi + batchSize);
+        for (let j = qi; j < end; j++) {
+            const qid = queryIds[j];
+            const qidx = idToIndex[qid];
+            if (qidx === undefined) { result[qid] = []; continue; }
+
+            const qEmb = processedEmbeddings[qidx];
+
+            // Keep a simple array of neighbors [ {dist, id} ] of size up to K
+            const neigh = [];
+
+            for (let i = 0; i < processedEmbeddings.length; i++) {
+                if (i === qidx) continue;
+                const emb = processedEmbeddings[i];
+                let d = 0;
+                if (metric === 'euclidean') {
+                    // use squared distance for speed
+                    const dx = squaredNorms[qidx] + squaredNorms[i] - 2 * emb.reduce((s, v, idx) => s + v * qEmb[idx], 0);
+                    d = dx;
+                } else {
+                    d = distFunc(qEmb, emb);
+                }
+
+                if (neigh.length < K) {
+                    neigh.push({ d, id: ids[i] });
+                    if (neigh.length === K) neigh.sort((a, b) => b.d - a.d); // descending
+                } else if (K > 0 && d < neigh[0].d) {
+                    neigh[0] = { d, id: ids[i] };
+                    // re-sort (neigh size == K)
+                    neigh.sort((a, b) => b.d - a.d);
+                }
+            }
+
+            // Convert to id array ordered nearest-first
+            neigh.sort((a, b) => a.d - b.d);
+            result[qid] = neigh.map(x => x.id);
+        }
+
+        // Yield to browser to keep UI responsive
+        await new Promise(resolve => requestAnimationFrame(resolve));
+    }
+
+    return result;
+}
+
 // Worker pool management
 class WorkerPool {
     constructor(numWorkers) {
@@ -540,15 +616,68 @@ async function runAnalysis() {
             const modelsFixed = ['no_model', 'pca', 'umap', 'tsne'];
             const metricsFixed = ['euclidean', 'cosine', 'sine'];
 
+            // Helper to render metric nicely (Title Case)
+            function displayMetric(metric) {
+                if (!metric) return '';
+                return metric[0].toUpperCase() + metric.slice(1).toLowerCase();
+            }
+
             let multiTableHtml = '';
             for (const kKey of Object.keys(runsByK).sort((a, b) => a - b)) {
                 const group = runsByK[kKey];
 
-                // Helper: find the most recent run matching the combo
-                function findMostRecentRun(textModel, textMetric, imageModel, imageMetric) {
+                // Build a list of combos (model, metric, components?) observed in this K group
+                // Each combo may or may not include a components value. We do NOT show dim by default;
+                // combos with an empty components string represent runs where components were not specified (e.g., no_model).
+                const comboMap = new Map(); // key -> { model, metric, components }
+
+                function addCombo(model, metric, components) {
+                    const compKey = (components === undefined || components === null || isNaN(Number(components))) ? '' : String(Number(components));
+                    const key = `${model}|${metric}|${compKey}`;
+                    if (!comboMap.has(key)) comboMap.set(key, { model, metric, components: compKey });
+                }
+
+                for (const rt of group) {
+                    if (rt.textModel && rt.textMetric) addCombo(rt.textModel, rt.textMetric, rt.textComponents);
+                    if (rt.imageModel && rt.imageMetric) addCombo(rt.imageModel, rt.imageMetric, rt.imageComponents);
+                }
+
+                // If no combos exist yet, fall back to showing model x metric without dims (components='')
+                if (comboMap.size === 0) {
+                    for (const m of modelsFixed) {
+                        for (const mm of metricsFixed) addCombo(m, mm, '');
+                    }
+                }
+
+                // Convert map to array and sort by model order then metric order then components (numeric, empty last)
+                const modelOrder = Object.fromEntries(modelsFixed.map((m, i) => [m, i]));
+                const metricOrder = Object.fromEntries(metricsFixed.map((m, i) => [m, i]));
+
+                const combos = Array.from(comboMap.values()).sort((a, b) => {
+                    if (modelOrder[a.model] !== modelOrder[b.model]) return modelOrder[a.model] - modelOrder[b.model];
+                    if (metricOrder[a.metric] !== metricOrder[b.metric]) return metricOrder[a.metric] - metricOrder[b.metric];
+                    const ca = a.components === '' ? Infinity : Number(a.components);
+                    const cb = b.components === '' ? Infinity : Number(b.components);
+                    return ca - cb;
+                });
+
+                // Helper to check if run's side matches a combo (components may be empty meaning unspecified)
+                function sideMatches(rtModel, rtMetric, rtComponents, combo) {
+                    if (rtModel !== combo.model) return false;
+                    if (rtMetric !== combo.metric) return false;
+                    if (combo.components === '') {
+                        // combo doesn't require a specific components value; accept runs where components are missing/NaN
+                        return (rtComponents === undefined || rtComponents === null || isNaN(Number(rtComponents)) || String(rtComponents) === '');
+                    }
+                    return Number(rtComponents) === Number(combo.components);
+                }
+
+                // Helper: find the most recent run matching the full combo (including components where specified)
+                function findMostRecentRun(textCombo, imageCombo) {
                     for (let i = group.length - 1; i >= 0; i--) {
                         const rt = group[i];
-                        if (rt.textModel === textModel && rt.textMetric === textMetric && rt.imageModel === imageModel && rt.imageMetric === imageMetric) {
+                        if (sideMatches(rt.textModel, rt.textMetric, rt.textComponents, textCombo) &&
+                            sideMatches(rt.imageModel, rt.imageMetric, rt.imageComponents, imageCombo)) {
                             return rt;
                         }
                     }
@@ -562,39 +691,44 @@ async function runAnalysis() {
                 // Header row
                 table += '<thead><tr>';
                 table += '<th style="border-bottom:1px solid #ddd; text-align:left; padding:6px;">Text \\ Image</th>';
-                for (const cm of modelsFixed) {
-                    for (const metric of metricsFixed) {
-                        let compLabel = '';
-                        if (cm === 'no_model') compLabel = ' (dim=768)';
-                        table += `<th style="border-bottom:1px solid #ddd; text-align:center; padding:6px;">${displayModel(cm)}${compLabel}<br>${metric.toUpperCase()}</th>`;
-                    }
+                for (const combo of combos) {
+                    const compLabel = combo.components === '' ? '' : ` (dim=${combo.components})`;
+                    table += `<th style="border-bottom:1px solid #ddd; text-align:center; padding:6px;">${displayModel(combo.model)}${compLabel}<br>${displayMetric(combo.metric)}</th>`;
                 }
                 table += '</tr></thead>';
 
                 // Body rows
                 table += '<tbody>';
-                for (const rm of modelsFixed) {
-                    for (const rmetric of metricsFixed) {
-                        let rowLabel = displayModel(rm);
-                        if (rm === 'no_model') rowLabel += ' (dim=768)';
-                        table += `<tr><td style="padding:6px; border-bottom:1px solid #f0f0f0;">${rowLabel}<br>${rmetric.toUpperCase()}</td>`;
+                for (const rowCombo of combos) {
+                    const rowLabel = rowCombo.components === '' ? `${displayModel(rowCombo.model)}` : `${displayModel(rowCombo.model)} (dim=${rowCombo.components})`;
+                    table += `<tr><td style="padding:6px; border-bottom:1px solid #f0f0f0;">${rowLabel}<br>${displayMetric(rowCombo.metric)}</td>`;
 
-                        for (const cm of modelsFixed) {
-                            for (const cmetric of metricsFixed) {
-                                const runMatch = findMostRecentRun(rm, rmetric, cm, cmetric);
-                                if (runMatch) {
-                                    table += `<td style="padding:6px; text-align:center;">${Number(runMatch.overallOverlap).toFixed(6)}</td>`;
-                                } else {
-                                    table += `<td style="padding:6px; text-align:center; color:#999;">-</td>`;
+                    for (const colCombo of combos) {
+                        // First try exact match (including components where specified)
+                        const runMatch = findMostRecentRun(rowCombo, colCombo);
+                        if (runMatch) {
+                            table += `<td style="padding:6px; text-align:center;">${Number(runMatch.overallOverlap).toFixed(6)}</td>`;
+                        } else {
+                            // Fallback: try matching ignoring components (match only model+metric)
+                            let fallback = null;
+                            for (let i = group.length - 1; i >= 0; i--) {
+                                const rt = group[i];
+                                if (rt.textModel === rowCombo.model && rt.textMetric === rowCombo.metric && rt.imageModel === colCombo.model && rt.imageMetric === colCombo.metric) {
+                                    fallback = rt; break;
                                 }
                             }
+                            if (fallback) {
+                                table += `<td style="padding:6px; text-align:center;">${Number(fallback.overallOverlap).toFixed(6)}</td>`;
+                            } else {
+                                table += `<td style="padding:6px; text-align:center; color:#999;">-</td>`;
+                            }
                         }
-
-                        table += '</tr>';
                     }
+
+                    table += '</tr>';
                 }
                 table += '</tbody></table>';
-                table += '<div style="font-size:0.9em; color:#666; margin-top:8px;">Each table shows the most recent overall-overlap value for the given Text (rows) vs Image (cols) model+metric combos for this K. Missing runs are shown as &quot;-&quot;.</div>';
+                table += '<div style="font-size:0.9em; color:#666; margin-top:8px;">Each table shows the most recent overall-overlap value for the given Text (rows) vs Image (cols) model+metric+dim combos for this K. Missing runs are shown as &quot;-&quot;.</div>';
                 table += '</div>';
 
                 multiTableHtml += table;
@@ -688,3 +822,277 @@ document.getElementById('image-dr-model').dispatchEvent(new Event('change'));
 // window.addEventListener('load', () => {
 //     // Optionally start loading here, but runAnalysis handles it safely.
 // });
+
+// -------------------------
+// Plot Overlap vs K (button wiring + worker-backed computation)
+// -------------------------
+const plotBtn = document.getElementById('plot-overlap-btn');
+const plotDisclaimer = document.getElementById('plot-disclaimer');
+const plotCanvas = document.getElementById('overlap-plot');
+let plotWorker = null;
+let overlapChart = null;
+
+function disablePlotUI(disabled) {
+    if (plotBtn) plotBtn.disabled = disabled;
+}
+
+async function startPlotOverlap() {
+    if (!data || data.length === 0) {
+        // Ensure the global `data` variable is populated by assigning the result
+        data = await loadData();
+        if (!data || data.length === 0) {
+            alert('Data not loaded; cannot compute plot.');
+            return;
+        }
+    }
+
+    // Determine maxK and requested K values
+    const configuredMax = 8373;
+    const maxK = Math.min(configuredMax, data.length - 1);
+
+    // Explicit K points requested by the user
+    const requestedKs = [0,1000,2000,3000,4000,5000,6000,7000,8000,8373];
+    // Clamp requested K values to the available maxK (data.length - 1) and deduplicate
+    const Ks = Array.from(new Set(requestedKs.map(k => Math.min(k, maxK)))).sort((a, b) => a - b);
+    // The K we need to compute neighbors up to is the maximum requested/clamped K
+    const knnK = Math.max(...Ks);
+
+    // Read current model/metric/params from UI (reuse logic from runAnalysis)
+    const textDrModel = document.getElementById('text-dr-model').value;
+    const textMetric = document.getElementById('text-metric').value;
+    let textComponents = parseInt(document.getElementById('text-components').value);
+    let textIterations = parseInt(document.getElementById('text-iterations').value);
+    const imageDrModel = document.getElementById('image-dr-model').value;
+    const imageMetric = document.getElementById('image-metric').value;
+    let imageComponents = parseInt(document.getElementById('image-components').value);
+    let imageIterations = parseInt(document.getElementById('image-iterations').value);
+
+    if (textDrModel !== 'no_model' && (isNaN(textComponents) || textComponents < 1)) textComponents = 3;
+    if (imageDrModel !== 'no_model' && (isNaN(imageComponents) || imageComponents < 1)) imageComponents = 3;
+    if (textDrModel === 'tsne' && (isNaN(textIterations) || textIterations < 10)) textIterations = 200;
+    if (imageDrModel === 'tsne' && (isNaN(imageIterations) || imageIterations < 10)) imageIterations = 200;
+
+    // Subsample to limit computation cost in the browser (stride sampling)
+    // Reduced default sample size to lower memory/clone cost when sending to the worker.
+    const maxSamples = Math.min(300, data.length);
+    const stride = Math.max(1, Math.floor(data.length / maxSamples));
+    const sampleIds = [];
+    for (let i = 0; i < data.length; i += stride) {
+        sampleIds.push(data[i].id);
+        if (sampleIds.length >= maxSamples) break;
+    }
+
+    plotDisclaimer.textContent = `Preparing to compute overlap vs K for ${sampleIds.length} samples. This may take a few minutes — progress will be shown.`;
+    disablePlotUI(true);
+
+    try {
+    // Compute KNN only for the sampled query IDs up to knnK to avoid constructing
+    // huge full-KNN maps which can crash the browser.
+    setStatus(`Plot: computing text KNN (K=${knnK}) for ${sampleIds.length} queries...`);
+    const textKNN = await computeKNNForQueries(data, sampleIds, knnK, 'text_embedding', textDrModel, textComponents, textIterations, textMetric);
+
+    setStatus(`Plot: computing image KNN (K=${knnK}) for ${sampleIds.length} queries...`);
+    const imageKNN = await computeKNNForQueries(data, sampleIds, knnK, 'image_embedding', imageDrModel, imageComponents, imageIterations, imageMetric);
+
+        setStatus('Plot: computing overlap series in worker...');
+
+        // Create a worker via Blob so we don't need to add a new file to the repo.
+        if (plotWorker) plotWorker.terminate();
+
+        const workerCode = `
+        self.onmessage = function(e) {
+            const { textKNN, imageKNN, sampleIds, maxK } = e.data;
+            const totals = new Uint32Array(maxK + 1);
+            const sampleCount = sampleIds.length;
+
+            for (let si = 0; si < sampleCount; si++) {
+                const id = sampleIds[si];
+                const textList = textKNN[id] || [];
+                const imageList = imageKNN[id] || [];
+
+                // Build position maps up to maxK
+                const posText = Object.create(null);
+                for (let i = 0; i < textList.length; i++) { posText[textList[i]] = i; }
+                const posImage = Object.create(null);
+                for (let i = 0; i < imageList.length; i++) { posImage[imageList[i]] = i; }
+
+                // bump array: neighbor with m = max(pt,pi) contributes to K > m, so bump at m+1
+                const bump = new Uint32Array(maxK + 1);
+
+                // Iterate union of keys (textList then imageList to avoid duplicates)
+                for (let i = 0; i < textList.length; i++) {
+                    const nid = textList[i];
+                    const pt = posText[nid];
+                    const pi = (posImage[nid] !== undefined) ? posImage[nid] : Infinity;
+                    const m = Math.max(pt, pi);
+                    if (m !== Infinity && m + 1 <= maxK) bump[m + 1]++;
+                }
+                for (let i = 0; i < imageList.length; i++) {
+                    const nid = imageList[i];
+                    if (posText[nid] !== undefined) continue; // already handled
+                    const pt = posText[nid] !== undefined ? posText[nid] : Infinity;
+                    const pi = posImage[nid];
+                    const m = Math.max(pt, pi);
+                    if (m !== Infinity && m + 1 <= maxK) bump[m + 1]++;
+                }
+
+                // cumulative and add to totals
+                let cum = 0;
+                // totals[0] remains 0
+                for (let k = 1; k <= maxK; k++) {
+                    cum += bump[k];
+                    totals[k] += cum;
+                }
+
+                if (si % 10 === 0) {
+                    const prog = Math.floor((si / sampleCount) * 100);
+                    self.postMessage({ type: 'progress', progress: prog });
+                }
+            }
+
+            // Send final totals and sampleCount
+            self.postMessage({ type: 'complete', totals: Array.from(totals), sampleCount });
+        };
+        `;
+
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    plotWorker = new Worker(URL.createObjectURL(blob));
+
+        plotWorker.onmessage = (ev) => {
+            const msg = ev.data;
+            if (msg.type === 'progress') {
+                plotDisclaimer.textContent = `Computing overlap series — ${msg.progress}%`;
+            } else if (msg.type === 'complete') {
+                const totals = msg.totals; // array length maxK+1 of total overlaps summed across samples
+                const sampleCount = msg.sampleCount;
+
+                // Build averaged overlap per K only for Ks of interest
+                const avgOverlaps = Ks.map(k => {
+                    const val = totals[k] || 0;
+                    const avg = val / sampleCount;
+                    return Number.isFinite(avg) ? avg : 0;
+                });
+
+                // Render Chart.js line (disable animations to avoid continuous motion)
+                if (overlapChart) {
+                    overlapChart.destroy();
+                    overlapChart = null;
+                }
+                const ctx = plotCanvas.getContext('2d');
+                overlapChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        datasets: [{
+                            label: 'Average overlap (samples averaged)',
+                            data: Ks.map((k, i) => ({ x: k, y: avgOverlaps[i] })),
+                            borderColor: 'rgba(75, 192, 192, 1)',
+                            backgroundColor: 'rgba(75, 192, 192, 0.1)',
+                            fill: true,
+                            pointRadius: Math.max(0, Math.min(3, Math.floor(300 / Ks.length))),
+                        }]
+                    },
+                    options: {
+                        animation: false,
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: { type: 'linear', min: 0, max: 8373, title: { display: true, text: 'K (neighbors) (0–8373)' } },
+                            y: { min: 0, max: 8373, title: { display: true, text: 'Average Overlap (0–8373)' } }
+                        }
+                    }
+                });
+
+                plotDisclaimer.textContent = `Plot complete (averaged over ${sampleCount} samples).`;
+                setStatus('Plot: complete');
+                disablePlotUI(false);
+                plotWorker.terminate();
+                plotWorker = null;
+            }
+        };
+
+        // Start worker; fallback to main-thread computation if structured clone fails
+        try {
+        plotWorker.postMessage({ textKNN, imageKNN, sampleIds, maxK: knnK });
+        } catch (postErr) {
+            console.warn('Failed to post large KNN data to worker; falling back to incremental main-thread computation.', postErr);
+            plotWorker.terminate();
+            plotWorker = null;
+            // Fallback: do an incremental computation on the main thread in chunks to avoid blocking UI
+            setStatus('Plot (fallback): computing overlap series on main thread in chunks...');
+            plotDisclaimer.textContent = 'Worker unavailable for this dataset size; running fallback (may take longer). Progress will be shown.';
+            // Perform similar logic without cloning big objects into a worker
+            (async function mainThreadFallback() {
+                const totals = new Array(knnK + 1).fill(0);
+                for (let si = 0; si < sampleIds.length; si++) {
+                    const id = sampleIds[si];
+                    const textList = textKNN[id] || [];
+                    const imageList = imageKNN[id] || [];
+                    const posText = Object.create(null);
+                    for (let i = 0; i < textList.length; i++) posText[textList[i]] = i;
+                    const posImage = Object.create(null);
+                    for (let i = 0; i < imageList.length; i++) posImage[imageList[i]] = i;
+                    const bump = new Array(knnK + 1).fill(0);
+                    for (let i = 0; i < textList.length; i++) {
+                        const nid = textList[i];
+                        const pt = posText[nid];
+                        const pi = (posImage[nid] !== undefined) ? posImage[nid] : Infinity;
+                        const m = Math.max(pt, pi);
+                        if (m !== Infinity && m + 1 <= knnK) bump[m + 1]++;
+                    }
+                    for (let i = 0; i < imageList.length; i++) {
+                        const nid = imageList[i];
+                        if (posText[nid] !== undefined) continue;
+                        const pt = posText[nid] !== undefined ? posText[nid] : Infinity;
+                        const pi = posImage[nid];
+                        const m = Math.max(pt, pi);
+                        if (m !== Infinity && m + 1 <= knnK) bump[m + 1]++;
+                    }
+                    // cumulative
+                    let cum = 0;
+                    for (let k = 1; k <= knnK; k++) {
+                        cum += bump[k];
+                        totals[k] += cum;
+                    }
+                    if (si % 10 === 0) {
+                        plotDisclaimer.textContent = `Fallback computing overlap — ${Math.floor((si / sampleIds.length) * 100)}%`;
+                        await new Promise(r => setTimeout(r, 10));
+                    }
+                }
+                const avgOverlaps = Ks.map(k => {
+                    const val = totals[k] || 0;
+                    const avg = val / sampleIds.length;
+                    return Number.isFinite(avg) ? avg : 0;
+                });
+                if (overlapChart) { overlapChart.destroy(); overlapChart = null; }
+                const ctx = plotCanvas.getContext('2d');
+                overlapChart = new Chart(ctx, {
+                    type: 'line',
+                    data: { datasets: [{ label: 'Average overlap (samples averaged)', data: Ks.map((k,i)=>({ x: k, y: avgOverlaps[i] })), borderColor: 'rgba(75,192,192,1)', backgroundColor: 'rgba(75,192,192,0.1)', fill: true, pointRadius: Math.max(0, Math.min(3, Math.floor(300 / Ks.length))) }]},
+                    options: { animation: false, responsive: true, maintainAspectRatio: false, scales: { x: { type: 'linear', min: 0, max: 8373, title: { display: true, text: 'K (neighbors) (0–8373)' } }, y: { min: 0, max: 8373, title: { display: true, text: 'Average Overlap (0–8373)' } } } }
+                });
+                plotDisclaimer.textContent = `Plot complete (fallback).`;
+                setStatus('Plot (fallback): complete');
+                disablePlotUI(false);
+            })();
+        }
+
+    } catch (err) {
+        console.error('Plotting error:', err);
+        alert('An error occurred while computing the plot: ' + err.message);
+        disablePlotUI(false);
+        plotDisclaimer.textContent = 'Plot failed. See console for details.';
+    }
+}
+
+if (plotBtn) {
+    plotBtn.addEventListener('click', () => {
+        if (plotWorker) {
+            plotWorker.terminate();
+            plotWorker = null;
+            disablePlotUI(false);
+            plotDisclaimer.textContent = 'Plot cancelled.';
+            return;
+        }
+        startPlotOverlap();
+    });
+}
