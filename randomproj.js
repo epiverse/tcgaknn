@@ -14,7 +14,7 @@ function gaussianRandom() {
  * Projects `embeddings` (Array of Array<number>) to `targetDim` using a random Gaussian matrix.
  * Returns a new array with Float32Array rows.
  */
-function randomProject(embeddings, targetDim = 50) {
+function randomProject(embeddings, targetDim = 40) {
     if (!Array.isArray(embeddings) || embeddings.length === 0) return embeddings;
     const n = embeddings.length;
     const d = embeddings[0].length;
